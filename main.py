@@ -124,7 +124,7 @@ class FallTemplateBot2026(ForecastBot):
         1  # Set this to whatever works for your search-provider/ai-model rate limits
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1
 
     ##################################### RESEARCH #####################################
 
@@ -709,7 +709,7 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
@@ -719,13 +719,16 @@ if __name__ == "__main__":
             "default": GeneralLlm(
                 model="openrouter/openai/gpt-5.4",
                 timeout=120,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
             "summarizer": "openrouter/openai/gpt-5.4-mini",
             "researcher": "openrouter/perplexity/sonar-pro-search",
-            "parser": "openrouter/openai/gpt-5.4-mini",
+            "parser": GeneralLlm(
+                model="openrouter/openai/gpt-5-mini",
+                timeout=60,
+                allowed_tries=5,
+            ),
         },
-    )
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
