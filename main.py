@@ -715,7 +715,7 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-            llms={
+        llms={
             "default": GeneralLlm(
                 model="openrouter/openai/gpt-5.4",
                 timeout=120,
@@ -729,6 +729,7 @@ if __name__ == "__main__":
                 allowed_tries=5,
             ),
         },
+    )
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
