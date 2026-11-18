@@ -128,40 +128,486 @@ class FallTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
 
+    ############################ OWL360 UPGRADES ############################
+    # Everything in this block is custom on top of the Metaculus template:
+    #   1. Multi-angle research (news + base rates + resolution status) run in parallel
+    #   2. Optional AskNews as a second news source (used automatically if keys are set)
+    #   3. Live prediction-market odds (Polymarket + Manifold) as a research input
+    #   4. A "persona ensemble": each of the N forecasts reasons from a different angle
+    #   5. A countdown/timing brief so the model reasons about time left
+    #   6. Smarter aggregation: geometric mean of odds, then cap at 3-97%
+    #   7. Statistical simulation model for numeric questions about market/economic data series
+
+    # Final binary forecasts are clamped to this range.
+    BINARY_FLOOR = 0.03
+    BINARY_CEILING = 0.97
+    # Each multiple-choice option keeps at least this much probability.
+    MC_FLOOR = 0.01
+    # Turn individual pieces on/off without touching the code below.
+    USE_MARKET_ODDS = True
+    USE_BASE_RATE_RESEARCH = True
+    USE_PERSONAS = True
+
+    PERSONAS = [
+        (
+            "Base-rate statistician",
+            "Start from the outside view. Name a reference class of similar past situations, "
+            "estimate how often outcomes like this happened, and only then adjust for the specifics "
+            "of this case. Keep adjustments modest unless the evidence is strong.",
+        ),
+        (
+            "News-driven analyst",
+            "Focus on the most recent concrete developments and their momentum. Ask what has to "
+            "happen, by whom, and by when for each outcome, and whether that timeline is realistic.",
+        ),
+        (
+            "Red-team skeptic",
+            "Your job is to find why the obvious answer could be wrong. Look for overlooked "
+            "scenarios, overconfidence in the research, and technicalities in the resolution "
+            "criteria or fine print that could flip the outcome.",
+        ),
+        (
+            "Market-aware trader",
+            "Treat any prediction-market prices in the research as a strong prior from people with "
+            "money at stake. If no market matches this exact question, anchor on the status quo. "
+            "Only deviate from a matching market when you can name the specific reason it is wrong "
+            "(different resolution criteria, different deadline, stale or thin market).",
+        ),
+        (
+            "Resolution-criteria lawyer",
+            "Read the resolution criteria and fine print literally. Decide exactly what evidence "
+            "would count, which source resolves it, and whether edge cases (partial events, delays, "
+            "ambiguous wording) push the answer one way. Forecast what the resolver will rule, not "
+            "what feels true.",
+        ),
+    ]
+
+    _persona_counters: dict = {}
+
+    def _next_persona(self, question: MetaculusQuestion) -> tuple[str, str]:
+        key = question.id_of_question or question.page_url
+        index = self._persona_counters.get(key, 0)
+        self._persona_counters[key] = index + 1
+        return self.PERSONAS[index % len(self.PERSONAS)]
+
+    @staticmethod
+    def _timing_brief(question: MetaculusQuestion) -> str:
+        now = datetime.now(timezone.utc)
+        lines = [f"Today (UTC): {now.strftime('%Y-%m-%d')}"]
+        for label, value in (
+            ("Question closes", question.close_time),
+            ("Scheduled resolution", question.scheduled_resolution_time),
+        ):
+            if value is None:
+                continue
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            days = (value - now).total_seconds() / 86400
+            lines.append(f"{label}: {value.strftime('%Y-%m-%d')} ({days:.1f} days from now)")
+        lines.append(
+            "Short windows favor the status quo: if the event has not happened yet and little "
+            "time is left, it usually will not happen."
+        )
+        return "\n".join(lines)
+
+    async def _invoke_forecaster(self, question: MetaculusQuestion, prompt: str) -> str:
+        preamble = ["TIMING:\n" + self._timing_brief(question)]
+        if self.USE_PERSONAS:
+            name, instructions = self._next_persona(question)
+            preamble.append(
+                f"YOUR ROLE ON THIS TEAM: {name}.\n{instructions}\n"
+                "Other forecasters on the team take different angles; your forecast will be "
+                "combined with theirs, so give your honest independent view."
+            )
+        full_prompt = "\n\n".join(preamble) + "\n\n" + prompt
+        reasoning = await self.get_llm("default", "llm").invoke(full_prompt)
+        if self.USE_PERSONAS:
+            reasoning = f"[Perspective: {name}]\n{reasoning}"
+        return reasoning
+
+    # ---------- research ----------
+
+    def _research_header(self, question: MetaculusQuestion) -> str:
+        return clean_indents(
+            f"""
+            Question:
+            {question.question_text}
+
+            This question's outcome will be determined by the specific criteria below:
+            {question.resolution_criteria}
+
+            {question.fine_print}
+            """
+        )
+
+    def _news_research_prompt(self, question: MetaculusQuestion) -> str:
+        return (
+            "You are an assistant to a superforecaster. Give a concise but detailed rundown of the "
+            "most relevant RECENT news (with dates) for the question below, and say whether it "
+            "would resolve Yes or No based on current information. Do not produce a forecast.\n\n"
+            + self._research_header(question)
+        )
+
+    def _base_rate_research_prompt(self, question: MetaculusQuestion) -> str:
+        return (
+            "You are an assistant to a superforecaster. Do NOT summarize today's news. Instead:\n"
+            "1. Identify 1-3 reference classes of comparable past events and give concrete base "
+            "rates with numbers and sources where possible.\n"
+            "2. Identify the official resolution source named in the criteria and report its "
+            "current value/status as precisely as you can (latest data point and date).\n"
+            "3. List any scheduled events before the deadline (votes, data releases, earnings, "
+            "court dates, launches) that could decide the outcome.\n"
+            "Do not produce a forecast.\n\n" + self._research_header(question)
+        )
+
+    async def _safe(self, label: str, coro) -> str:
+        try:
+            result = await coro
+            return result or ""
+        except Exception as e:  # one failing source should never sink the question
+            logger.warning(f"Research source '{label}' failed: {e}")
+            return ""
+
+    async def _asknews_research(self, question: MetaculusQuestion) -> str:
+        import os
+
+        if not (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")):
+            return ""
+        return await AskNewsSearcher().call_preconfigured_version(
+            "asknews/news-summaries", question.question_text
+        )
+
+    async def _market_search_query(self, question: MetaculusQuestion) -> str:
+        prompt = (
+            "Write a short search query (3-6 words, no quotes, no punctuation) that would find a "
+            "prediction market about this question on Polymarket. Output only the query.\n\n"
+            f"Question: {question.question_text}"
+        )
+        query = await self.get_llm("summarizer", "llm").invoke(prompt)
+        return query.strip().strip('"').splitlines()[0][:80]
+
+    async def _market_odds_research(self, question: MetaculusQuestion) -> str:
+        import json
+
+        import httpx
+
+        query = await self._market_search_query(question)
+        lines: list[str] = []
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Polymarket (real money)
+            try:
+                r = await client.get(
+                    "https://gamma-api.polymarket.com/public-search",
+                    params={"q": query, "limit_per_type": 10},
+                )
+                r.raise_for_status()
+                for event in (r.json().get("events") or [])[:10]:
+                    if event.get("closed"):
+                        continue
+                    for m in (event.get("markets") or [])[:4]:
+                        if m.get("closed"):
+                            continue
+                        try:
+                            outcomes = json.loads(m.get("outcomes") or "[]")
+                            prices = json.loads(m.get("outcomePrices") or "[]")
+                        except (TypeError, ValueError):
+                            continue
+                        if not outcomes or len(outcomes) != len(prices):
+                            continue
+                        priced = ", ".join(
+                            f"{o}: {float(p) * 100:.0f}%" for o, p in zip(outcomes, prices)
+                        )
+                        volume = float(m.get("volume") or 0)
+                        end = (m.get("endDate") or event.get("endDate") or "")[:10]
+                        lines.append(
+                            f"- Polymarket | {m.get('question') or event.get('title')} | "
+                            f"{priced} | ends {end or '?'} | volume ${volume:,.0f}"
+                        )
+            except Exception as e:
+                logger.warning(f"Polymarket lookup failed: {e}")
+            # Manifold (play money, but broad coverage)
+            try:
+                r = await client.get(
+                    "https://api.manifold.markets/v0/search-markets",
+                    params={"term": query, "filter": "open", "limit": 5},
+                )
+                r.raise_for_status()
+                for m in r.json()[:5]:
+                    if m.get("outcomeType") != "BINARY" or m.get("probability") is None:
+                        continue
+                    lines.append(
+                        f"- Manifold (play money) | {m.get('question')} | "
+                        f"Yes: {m['probability'] * 100:.0f}% | traders: {m.get('uniqueBettorCount', '?')}"
+                    )
+            except Exception as e:
+                logger.warning(f"Manifold lookup failed: {e}")
+        if not lines:
+            return ""
+        return (
+            f"Search query used: '{query}'. These markets were found by keyword search and may NOT "
+            "match this exact question. Check the wording, deadline and resolution criteria "
+            "before relying on any of them; ignore ones that are about something different. "
+            "Thin markets (low volume / few traders) are weak evidence.\n" + "\n".join(lines[:12])
+        )
+
+    # ---------- statistical model for numeric data-series questions ----------
+    # For numeric questions about a fetchable series (stock/index/crypto/FX/commodity
+    # prices via Yahoo Finance, economic data via FRED), simulate the series forward
+    # from its own historical moves and hand the AI the resulting percentiles as an anchor.
+
+    USE_SERIES_MODEL = True
+    SERIES_MODEL_PATHS = 20000
+
+    async def _identify_series(self, question: MetaculusQuestion) -> dict | None:
+        import json
+
+        prompt = clean_indents(
+            f"""
+            Decide whether this forecasting question asks for the future value of a public data
+            series that can be downloaded, and if so identify it. Reply with ONLY a JSON object.
+
+            Use source "yahoo" for market prices (stocks like AAPL, indices like ^GSPC ^NDX ^DJI
+            ^VIX ^TNX, crypto like BTC-USD ETH-USD, FX like EURUSD=X USDJPY=X, futures like CL=F
+            GC=F). Use source "fred" for US economic data with its FRED series id (e.g. UNRATE,
+            CPIAUCSL, FEDFUNDS, DGS10, PAYEMS, GDP, MORTGAGE30US, DCOILWTICO).
+
+            transform: "level" if the question asks for the series value itself; "yoy_pct" if it
+            asks for the year-over-year % change of the series (e.g. CPI inflation rate).
+            If the question needs any other calculation, a different statistic (max, average,
+            count), or no matching series exists, set source to "none".
+
+            target_date: the date (YYYY-MM-DD) whose value resolves the question.
+            additive: true if the series is a rate/percentage that can approach zero or go
+            negative (interest rates, unemployment rate, yields); false for prices and levels.
+
+            Format: {{"source": "yahoo"|"fred"|"none", "symbol": "...", "transform": "level"|"yoy_pct",
+            "target_date": "YYYY-MM-DD", "additive": true|false, "units_note": "..."}}
+
+            Question: {question.question_text}
+            Resolution criteria: {question.resolution_criteria}
+            Fine print: {question.fine_print}
+            Unit of measure: {getattr(question, "unit_of_measure", "") or "unspecified"}
+            """
+        )
+        raw = await self.get_llm("summarizer", "llm").invoke(prompt)
+        try:
+            spec = json.loads(raw[raw.index("{") : raw.rindex("}") + 1])
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if spec.get("source") not in ("yahoo", "fred") or not spec.get("symbol"):
+            return None
+        return spec
+
+    @staticmethod
+    async def _fetch_series(source: str, symbol: str) -> list[tuple]:
+        """Returns [(date, value), ...] sorted by date."""
+        import csv
+        import io
+
+        import httpx
+
+        headers = {"User-Agent": "Mozilla/5.0 (forecasting bot; contact via Metaculus)"}
+        async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
+            if source == "fred":
+                r = await client.get(
+                    "https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": symbol}
+                )
+                r.raise_for_status()
+                rows = list(csv.reader(io.StringIO(r.text)))[1:]
+                out = []
+                for row in rows:
+                    if len(row) < 2 or row[1] in ("", "."):
+                        continue
+                    out.append((datetime.strptime(row[0], "%Y-%m-%d").date(), float(row[1])))
+                return out
+            last_error = None
+            for host in ("query1", "query2"):
+                try:
+                    r = await client.get(
+                        f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}",
+                        params={"range": "3y", "interval": "1d"},
+                    )
+                    r.raise_for_status()
+                    result = r.json()["chart"]["result"][0]
+                    closes = result["indicators"]["quote"][0]["close"]
+                    return [
+                        (datetime.fromtimestamp(t, tz=timezone.utc).date(), float(c))
+                        for t, c in zip(result["timestamp"], closes)
+                        if c is not None
+                    ]
+                except Exception as e:
+                    last_error = e
+            raise RuntimeError(f"Yahoo fetch failed for {symbol}: {last_error}")
+
+    @classmethod
+    def _simulate_series(cls, series, target_date, additive: bool, transform: str, n_paths: int):
+        """Bootstrap the series' own historical step changes forward to target_date."""
+        import numpy as np
+
+        dates = [d for d, _ in series]
+        values = np.array([v for _, v in series], dtype=float)
+        if len(values) < 30:
+            raise ValueError("not enough history")
+        gaps = np.diff([d.toordinal() for d in dates])
+        step_days = float(np.median(gaps))  # ~1 for daily, ~30 for monthly, ~7 weekly
+        last_date, last_value = dates[-1], values[-1]
+        days_ahead = (target_date - last_date).days
+        if days_ahead <= 0:
+            return None  # already known or past; let the AI read the data
+        if step_days <= 1.5:  # daily trading data: count weekdays
+            steps = int(np.busday_count(last_date, target_date))
+            lookback = 750
+        else:
+            steps = max(1, round(days_ahead / step_days))
+            lookback = 120
+        use_additive = additive or values.min() <= 0
+        hist = values[-(lookback + 1):]
+        moves = np.diff(hist) if use_additive else np.diff(np.log(hist))
+        rng = np.random.default_rng(7)
+        draws = rng.choice(moves, size=(n_paths, max(steps, 1)))
+        if step_days <= 1.5:
+            # daily market prices: remove drift so we don't extrapolate a past rally/selloff
+            draws = draws - moves.mean()
+        else:
+            # economic series (CPI, payrolls, GDP...): the trend IS the signal, so keep the
+            # recent trend (last ~3 years of steps) instead of the long-run one
+            draws = draws - moves.mean() + moves[-36:].mean()
+        total = draws.sum(axis=1)
+        finals = last_value + total if use_additive else last_value * np.exp(total)
+        if transform == "yoy_pct":
+            year_ago_target = target_date.replace(year=target_date.year - 1)
+            past = [v for d, v in series if d <= year_ago_target]
+            if not past:
+                raise ValueError("no value a year before target date")
+            finals = (finals / past[-1] - 1) * 100
+            current = (last_value / [v for d, v in series if d <= last_date.replace(year=last_date.year - 1)][-1] - 1) * 100
+        else:
+            current = last_value
+        qs = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+        pct = dict(zip(qs, np.percentile(finals, qs)))
+        return {
+            "last_date": last_date,
+            "last_value": last_value,
+            "current": current,
+            "steps": steps,
+            "step_days": step_days,
+            "additive": use_additive,
+            "percentiles": pct,
+            "finals": finals,
+        }
+
+    async def _series_model_research(self, question: MetaculusQuestion) -> str:
+        import numpy as np
+
+        if not isinstance(question, NumericQuestion):
+            return ""
+        spec = await self._identify_series(question)
+        if not spec:
+            return ""
+        try:
+            target = datetime.strptime(spec["target_date"], "%Y-%m-%d").date()
+        except (KeyError, ValueError):
+            when = question.scheduled_resolution_time or question.close_time
+            if when is None:
+                return ""
+            target = when.date()
+        series = await self._fetch_series(spec["source"], spec["symbol"])
+        transform = spec.get("transform", "level")
+        sim = self._simulate_series(
+            series, target, bool(spec.get("additive")), transform, self.SERIES_MODEL_PATHS
+        )
+        if sim is None:
+            return ""
+        p = sim["percentiles"]
+        fmt = lambda x: f"{x:,.4g}"
+        lines = [
+            f"Series: {spec['symbol']} ({spec['source']}), transform: {transform}. {spec.get('units_note', '')}",
+            f"Latest observation: {fmt(sim['last_value'])} on {sim['last_date']}"
+            + (f" (current YoY: {sim['current']:.2f}%)" if transform == "yoy_pct" else ""),
+            f"Target date: {target} (~{sim['steps']} steps of ~{sim['step_days']:.0f} day(s) ahead).",
+            "Model: bootstrap of this series' own historical "
+            + ("changes" if sim["additive"] else "% moves")
+            + f", {self.SERIES_MODEL_PATHS:,} simulated paths, "
+            + ("trend removed." if sim["step_days"] <= 1.5 else "recent ~3-year trend kept."),
+            "Model percentiles: "
+            + ", ".join(f"P{q}={fmt(v)}" for q, v in p.items()),
+        ]
+        lb, ub = getattr(question, "lower_bound", None), getattr(question, "upper_bound", None)
+        finals = sim["finals"]
+        if lb is not None and ub is not None:
+            lines.append(
+                f"Model P(below question lower bound {fmt(lb)}) = {np.mean(finals < lb):.1%}; "
+                f"P(above upper bound {fmt(ub)}) = {np.mean(finals > ub):.1%}."
+            )
+        lines.append(
+            "How to use this: it is a purely statistical baseline that knows nothing about news. "
+            "Keep your distribution close to it, especially its width and tails, unless the "
+            "research names a specific scheduled catalyst (data release, earnings, central bank "
+            "meeting, policy change) or a resolution detail that the model cannot know. Check the "
+            "series matches the resolution source; if it does not, ignore this section."
+        )
+        return "\n".join(lines)
+
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = self._get_research_prompt(question, researcher)
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
+            researcher = self.get_llm("researcher", "llm")
+            jobs = {
+                "RECENT NEWS": self._safe("news", researcher.invoke(self._news_research_prompt(question))),
+                "ASKNEWS HEADLINES": self._safe("asknews", self._asknews_research(question)),
+            }
+            if self.USE_BASE_RATE_RESEARCH:
+                jobs["BASE RATES, RESOLUTION SOURCE & UPCOMING CATALYSTS"] = self._safe(
+                    "base rates", researcher.invoke(self._base_rate_research_prompt(question))
                 )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
+            if self.USE_MARKET_ODDS:
+                jobs["PREDICTION MARKET PRICES"] = self._safe(
+                    "markets", self._market_odds_research(question)
                 )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+            if self.USE_SERIES_MODEL and isinstance(question, NumericQuestion):
+                jobs["STATISTICAL MODEL (historical-volatility simulation)"] = self._safe(
+                    "series model", self._series_model_research(question)
+                )
+            results = await asyncio.gather(*jobs.values())
+            sections = [
+                f"=== {title} ===\n{text.strip()}"
+                for title, text in zip(jobs.keys(), results)
+                if text and text.strip()
+            ]
+            if not sections:
+                raise RuntimeError("All research sources failed for this question")
+            research = "\n\n".join(sections)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    # ---------- aggregation ----------
+
+    async def _aggregate_predictions(self, predictions, question):
+        import math
+
+        if isinstance(question, BinaryQuestion):
+            clipped = [min(max(float(p), 0.01), 0.99) for p in predictions]
+            mean_log_odds = sum(math.log(p / (1 - p)) for p in clipped) / len(clipped)
+            pooled = 1 / (1 + math.exp(-mean_log_odds))
+            final = min(max(pooled, self.BINARY_FLOOR), self.BINARY_CEILING)
+            logger.info(
+                f"Aggregated {len(clipped)} forecasts {[round(p, 3) for p in clipped]} -> {final:.3f}"
+            )
+            return final
+        aggregate = await super()._aggregate_predictions(predictions, question)
+        if isinstance(question, MultipleChoiceQuestion):
+            from forecasting_tools.data_models.multiple_choice_report import PredictedOption
+
+            floored = [max(o.probability, self.MC_FLOOR) for o in aggregate.predicted_options]
+            total = sum(floored)
+            aggregate = PredictedOptionList(
+                predicted_options=[
+                    PredictedOption(option_name=o.option_name, probability=p / total)
+                    for o, p in zip(aggregate.predicted_options, floored)
+                ]
+            )
+        return aggregate
+
+    ######################### END OWL360 UPGRADES ##########################
 
     @staticmethod
     def _get_research_prompt(
@@ -235,7 +681,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -317,7 +763,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -400,7 +846,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -496,7 +942,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -709,7 +1155,7 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=3,
+        predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
