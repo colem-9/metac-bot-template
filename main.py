@@ -1190,11 +1190,18 @@ if __name__ == "__main__":
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
+    # COST CONTROL: we joined the Fall seasonal tournament late, so it isn't worth the API
+    # spend. Set this to True for the Spring season to forecast on both again.
+    FORECAST_ON_SEASONAL_TOURNAMENT = False
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        seasonal_tournament_reports = (
+            asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                )
             )
+            if FORECAST_ON_SEASONAL_TOURNAMENT
+            else []
         )
         minibench_reports = asyncio.run(
             template_bot.forecast_on_tournament(
